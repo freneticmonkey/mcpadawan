@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mcpadawan": {
+      "command": "cargo",
+      "args": ["run", "--", "--mcp"],
+      "cwd": "/Users/scott/development/projects/mcpadawan"
+    }
+  }
+}

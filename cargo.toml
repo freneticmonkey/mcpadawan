@@ -15,6 +15,15 @@ vigem-client = { version = "0.1.4", optional = true }
 
 clap = { version = "4.0", features = ["derive"] }
 toml = "0.8"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio-test = "0.4"
+axum-test = "15.0"
+tower = "0.5"
+hyper = "1.0"
+tempfile = "3.10"
+mockall = "0.12"
 
 [features]
 default = []

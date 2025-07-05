@@ -11,7 +11,7 @@ MCPadawan gives you **force-like powers** over input simulation and gamepad emul
 - 🖱 Mouse input: absolute & relative movement, clicks, scrolling
 - ⌨ Keyboard typing and sequences
 - 🧠 Launch and stop external applications
-- 🖼 Screenshot the primary display
+- 🖼 Screenshot the primary display with configurable resolution and scaling
 - 🎮 Xbox 360 virtual controller emulation via ViGEm
 - 🔌 HTTP API using `axum` (async + fast)
 
@@ -79,6 +79,25 @@ POST /type
 }
 ```
 
+### 🖼 Take Screenshot
+
+```http
+# Basic screenshot
+GET /screenshot
+
+# Scaled screenshot (50% of original size)
+GET /screenshot?scale=0.5
+
+# Fixed width, maintaining aspect ratio
+GET /screenshot?width=800
+
+# Fixed height, maintaining aspect ratio
+GET /screenshot?height=600
+
+# Exact dimensions
+GET /screenshot?width=1920&height=1080
+```
+
 ### 🎮 Send Gamepad Input
 
 ```http
@@ -105,7 +124,49 @@ make check       # Syntax/type checks
 make build       # Build release binary
 make clean       # Clean target dir
 make driver-check  # Check ViGEm driver (Windows only)
+
+# Testing
+cargo test                    # Run all tests
+cargo test --test integration_tests  # Run integration tests only
+cargo test screenshot         # Run screenshot-related tests
+
+# MCP Mode
+cargo run -- --mcp          # Run as MCP server for Claude integration
 ```
+
+---
+
+## 🤖 Claude Integration
+
+MCPadawan can integrate directly with Claude Desktop and Claude Code as an MCP (Model Context Protocol) server:
+
+### Claude Code (CLI)
+```bash
+# Add MCPadawan as an MCP server
+cd /path/to/mcpadawan
+claude mcp add mcpadawan cargo run -- --mcp
+
+# Then start Claude Code normally
+claude-code
+```
+
+### Claude Desktop
+Add to your `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "mcpadawan": {
+      "command": "cargo",
+      "args": ["run", "--", "--mcp"],
+      "cwd": "/path/to/mcpadawan"
+    }
+  }
+}
+```
+
+📖 **Setup Guides:**
+- [Claude Code Setup](CLAUDE_CODE_SETUP.md) - For CLI integration
+- [Claude Desktop Setup](MCP_SETUP.md) - For desktop app integration
 
 ---
 
