@@ -12,6 +12,12 @@ fn create_test_state() -> AppState {
         #[cfg(feature = "vigem")]
         controller: Arc::new(Mutex::new(None)),
         vigem_enabled: false,
+        app_pid: Arc::new(Mutex::new(None)),
+        #[cfg(target_os = "macos")]
+        capture_manager: {
+            use mcpadawan::capture::CaptureManager;
+            Arc::new(Mutex::new(CaptureManager::new()))
+        },
     }
 }
 

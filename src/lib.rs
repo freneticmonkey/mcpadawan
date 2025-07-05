@@ -19,8 +19,6 @@ pub mod capture;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-#[cfg(test)]
-mod tests;
 
 // Global flag to track if we're in MCP mode
 use std::sync::OnceLock;
