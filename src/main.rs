@@ -103,6 +103,22 @@ async fn main() {
         controller: Arc::new(Mutex::new(controller)),
         vigem_enabled: !vigem_disabled && cfg!(feature = "vigem"),
         app_pid: Arc::new(Mutex::new(None)),
+        #[cfg(target_os = "macos")]
+        capture_manager: {
+            use mcpadawan::capture::CaptureManager;
+            #[cfg(target_os = "macos")]
+            use mcpadawan::capture::native::NativeMacOSCapture;
+            #[cfg(target_os = "macos")]
+            use mcpadawan::capture::fallback::FallbackCapture;
+            
+            let mut manager = CaptureManager::new();
+            #[cfg(target_os = "macos")]
+            {
+                manager.add_strategy(Box::new(NativeMacOSCapture::new()));
+                manager.add_strategy(Box::new(FallbackCapture::new()));
+            }
+            Arc::new(Mutex::new(manager))
+        },
     };
 
     if args.mcp {

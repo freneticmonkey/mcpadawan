@@ -5,21 +5,22 @@ use serde::Deserialize;
 use std::{process::{Command, Child}, sync::{Arc, Mutex}};
 use enigo::{Enigo, MouseControllable, KeyboardControllable, MouseButton};
 use screenshots::Screen;
-use image::{ImageBuffer, imageops};
+use image::imageops;
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone)]
-pub struct WindowInfo {
-    pub id: u32,
-    pub name: String,
-    pub owner_name: String,
-    pub bounds: (f64, f64, f64, f64), // (x, y, width, height)
-    pub pid: u32,
-}
+pub use macos::WindowInfo;
 #[cfg(feature = "vigem")]
 use vigem_client::{Client, TargetId, Target};
 
 pub mod mcp;
+pub mod error;
+pub mod capture;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+#[cfg(test)]
+mod tests;
 
 // Global flag to track if we're in MCP mode
 use std::sync::OnceLock;
@@ -69,6 +70,8 @@ pub struct AppState {
     pub controller: Arc<Mutex<Option<Target>>>,
     pub vigem_enabled: bool,
     pub app_pid: Arc<Mutex<Option<u32>>>,
+    #[cfg(target_os = "macos")]
+    pub capture_manager: Arc<Mutex<capture::CaptureManager>>,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -123,22 +126,9 @@ pub struct ScreenshotQuery {
 
 #[cfg(target_os = "macos")]
 impl AppState {
-    pub fn get_windows_for_pid(&self, _pid: u32) -> Result<Vec<WindowInfo>, String> {
-        // Simplified implementation - for now just return a placeholder
-        // A full implementation would use Core Graphics APIs to enumerate windows
-        // and filter by PID, but the current core-graphics crate version doesn't
-        // provide all the APIs we need in an easily accessible way
-        
-        // Return a mock window to indicate the application is running
-        let mock_window = WindowInfo {
-            id: 1,
-            name: "Application Window".to_string(),
-            owner_name: "Application".to_string(),
-            bounds: (100.0, 100.0, 800.0, 600.0), // Mock bounds
-            pid: _pid,
-        };
-        
-        Ok(vec![mock_window])
+    pub fn get_windows_for_pid(&self, pid: u32) -> Result<Vec<WindowInfo>, String> {
+        let mut enumerator = macos::WindowEnumerator::new();
+        enumerator.find_by_pid(pid).map_err(|e| format!("Failed to enumerate windows: {}", e))
     }
 }
 
@@ -221,9 +211,39 @@ pub async fn keyboard_type(State(state): State<AppState>, Json(payload): Json<Ty
 }
 
 pub async fn screenshot(Query(params): Query<ScreenshotQuery>) -> axum::response::Response<axum::body::Body> {
-    // Simplified implementation that works with current Axum version
-    // For now, always capture full screen with basic window detection placeholder
+    #[cfg(target_os = "macos")]
+    {
+        // Try native macOS capture first
+        if let Ok(image) = capture_with_native_macos(&params).await {
+            return image;
+        }
+    }
+    
+    // Fallback to existing implementation
     capture_full_screen_with_crop(&params, None).await
+}
+
+#[cfg(target_os = "macos")]
+async fn capture_with_native_macos(params: &ScreenshotQuery) -> Result<axum::response::Response<axum::body::Body>, String> {
+    use crate::capture::{CaptureManager, CaptureTarget};
+    use crate::capture::native::NativeMacOSCapture;
+    
+    let mut manager = CaptureManager::new();
+    manager.add_strategy(Box::new(NativeMacOSCapture::new()));
+    
+    let image = manager.capture(CaptureTarget::FullScreen)
+        .map_err(|e| format!("Native capture failed: {}", e))?;
+    
+    let processed_image = apply_image_transformations(image, params);
+    
+    let mut png_bytes = Vec::new();
+    processed_image.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+    
+    Ok(axum::response::Response::builder()
+        .header("Content-Type", "image/png")
+        .body(axum::body::Body::from(png_bytes))
+        .unwrap())
 }
 
 async fn capture_full_screen_with_crop(params: &ScreenshotQuery, crop_bounds: Option<(f64, f64, f64, f64)>) -> axum::response::Response<axum::body::Body> {
@@ -284,49 +304,98 @@ pub fn apply_image_transformations(rgba_image: image::RgbaImage, params: &Screen
 }
 
 fn process_screenshot_image(image: screenshots::Image, params: &ScreenshotQuery, crop_bounds: Option<(f64, f64, f64, f64)>) -> axum::response::Response<axum::body::Body> {
-    // Convert BGRA to RGBA manually
     let width = image.width() as u32;
     let height = image.height() as u32;
     let buffer = image.buffer();
     
-    // Convert BGRA to RGBA
-    let mut rgba_buffer = Vec::with_capacity(buffer.len());
-    for chunk in buffer.chunks_exact(4) {
-        rgba_buffer.push(chunk[2]); // B -> R
-        rgba_buffer.push(chunk[1]); // G -> G
-        rgba_buffer.push(chunk[0]); // R -> B
-        rgba_buffer.push(chunk[3]); // A -> A
+    // Diagnostic information about the buffer
+    let pixels_count = (width * height) as usize;
+    let expected_rgba_size = pixels_count * 4;
+    let bytes_per_pixel = buffer.len() as f64 / pixels_count as f64;
+    
+    println!("=== HTTP Screenshot Buffer Diagnostic ===");
+    println!("Image dimensions: {}x{}", width, height);
+    println!("Total pixels: {}", pixels_count);
+    println!("Buffer length: {} bytes", buffer.len());
+    println!("Expected RGBA size: {} bytes", expected_rgba_size);
+    println!("Actual bytes per pixel: {:.3}", bytes_per_pixel);
+    
+    // Sample first few pixels for analysis
+    if buffer.len() >= 12 {
+        println!("First 3 pixels (raw bytes): {:?}", &buffer[0..12]);
     }
     
-    let rgba_image = match image::RgbaImage::from_raw(width, height, rgba_buffer) {
-        Some(img) => img,
-        None => {
-            return axum::response::Response::builder()
-                .status(500)
-                .body(axum::body::Body::from(format!("Failed to create RGBA image: {}x{}, buffer len: {}", width, height, buffer.len())))
-                .unwrap();
+    // Try different approaches based on buffer size
+    if buffer.len() == expected_rgba_size {
+        println!("Buffer size matches RGBA expectation - trying direct conversion");
+        let rgba_buffer = buffer.to_vec();
+        if let Some(rgba_image) = image::RgbaImage::from_raw(width, height, rgba_buffer) {
+            let processed_image = apply_image_transformations(rgba_image, params);
+            return create_png_response(processed_image);
         }
-    };
-    
-    // Apply cropping if bounds are specified
-    let cropped_image = if let Some((x, y, w, h)) = crop_bounds {
-        let crop_x = (x.max(0.0) as u32).min(rgba_image.width());
-        let crop_y = (y.max(0.0) as u32).min(rgba_image.height());
-        let crop_w = (w.max(0.0) as u32).min(rgba_image.width() - crop_x);
-        let crop_h = (h.max(0.0) as u32).min(rgba_image.height() - crop_y);
-        
-        if crop_w > 0 && crop_h > 0 {
-            image::imageops::crop_imm(&rgba_image, crop_x, crop_y, crop_w, crop_h).to_image()
-        } else {
-            rgba_image
+    } else if buffer.len() == pixels_count * 3 {
+        println!("Buffer size matches RGB expectation - converting to RGBA");
+        let mut rgba_buffer = Vec::with_capacity(expected_rgba_size);
+        for chunk in buffer.chunks_exact(3) {
+            rgba_buffer.push(chunk[0]); // R
+            rgba_buffer.push(chunk[1]); // G
+            rgba_buffer.push(chunk[2]); // B
+            rgba_buffer.push(255);      // A
+        }
+        if let Some(rgba_image) = image::RgbaImage::from_raw(width, height, rgba_buffer) {
+            let processed_image = apply_image_transformations(rgba_image, params);
+            return create_png_response(processed_image);
         }
     } else {
-        rgba_image
-    };
+        println!("Unexpected buffer size - checking for compression or different format");
+        
+        // Check if it might be compressed data (PNG signature or unusual size)
+        let has_png_signature = buffer.len() >= 8 && 
+            buffer[0] == 137 && buffer[1] == 80 && buffer[2] == 78 && buffer[3] == 71;
+        
+        if buffer.len() < pixels_count || has_png_signature {
+            if has_png_signature {
+                println!("Buffer has PNG signature - attempting PNG decode");
+            } else {
+                println!("Buffer appears to be compressed (smaller than pixel count)");
+            }
+            
+            // Try to decode as PNG
+            println!("Attempting to decode as PNG...");
+            match image::load_from_memory(buffer) {
+                Ok(decoded_image) => {
+                    println!("Successfully decoded buffer as compressed image format: {:?}", decoded_image.color());
+                    let rgba_image = decoded_image.to_rgba8();
+                    let processed_image = apply_image_transformations(rgba_image, params);
+                    return create_png_response(processed_image);
+                },
+                Err(e) => {
+                    println!("Failed to decode as PNG: {:?}", e);
+                }
+            }
+            
+            // Try other common formats
+            for format in [image::ImageFormat::Jpeg, image::ImageFormat::WebP, image::ImageFormat::Bmp] {
+                if let Ok(decoded_image) = image::load_from_memory_with_format(buffer, format) {
+                    println!("Successfully decoded buffer as {:?}", format);
+                    let rgba_image = decoded_image.to_rgba8();
+                    let processed_image = apply_image_transformations(rgba_image, params);
+                    return create_png_response(processed_image);
+                }
+            }
+        }
+    }
     
-    // Apply transformations using the shared function
-    let processed_image = apply_image_transformations(cropped_image, params);
+    println!("=== End HTTP Diagnostic ===");
     
+    return axum::response::Response::builder()
+        .status(500)
+        .body(axum::body::Body::from(format!("Failed to process screenshot buffer: {}x{}, buffer len: {}, bytes per pixel: {:.3}", 
+                                           width, height, buffer.len(), bytes_per_pixel)))
+        .unwrap();
+}
+
+fn create_png_response(processed_image: image::RgbaImage) -> axum::response::Response<axum::body::Body> {
     // Convert to PNG bytes
     let mut png_bytes = Vec::new();
     match processed_image.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png) {
@@ -393,6 +462,8 @@ mod tests {
             controller: Arc::new(Mutex::new(None)),
             vigem_enabled: false,
             app_pid: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            capture_manager: Arc::new(Mutex::new(capture::CaptureManager::new())),
         }
     }
 
