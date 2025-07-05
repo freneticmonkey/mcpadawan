@@ -15,6 +15,7 @@ struct JsonRpcRequest {
 
 #[derive(serde::Serialize)]
 struct JsonRpcResponse {
+    jsonrpc: String,
     id: Option<Value>,
     result: Option<Value>,
     error: Option<JsonRpcError>,
@@ -47,12 +48,40 @@ impl McpServer {
             match reader.read_line(&mut line).await? {
                 0 => break, // EOF
                 _ => {
-                    if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line) {
-                        let response = self.handle_request(request).await;
-                        let response_json = serde_json::to_string(&response)?;
-                        stdout.write_all(response_json.as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
-                        stdout.flush().await?;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    
+                    // eprintln!("Received: {}", trimmed);
+                    
+                    match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+                        Ok(request) => {
+                            let response = self.handle_request(request).await;
+                            let response_json = serde_json::to_string(&response)?;
+                            // eprintln!("Sending: {}", response_json);
+                            stdout.write_all(response_json.as_bytes()).await?;
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
+                        }
+                        Err(e) => {
+                            // eprintln!("JSON parse error: {}", e);
+                            // Try to extract id from malformed JSON for error response
+                            let error_response = JsonRpcResponse {
+                                jsonrpc: "2.0".to_string(),
+                                id: None,
+                                result: None,
+                                error: Some(JsonRpcError {
+                                    code: -32700,
+                                    message: "Parse error".to_string(),
+                                    data: Some(json!({"error": e.to_string()})),
+                                }),
+                            };
+                            let error_json = serde_json::to_string(&error_response)?;
+                            stdout.write_all(error_json.as_bytes()).await?;
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
+                        }
                     }
                 }
             }
@@ -64,9 +93,11 @@ impl McpServer {
     async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request.id).await,
+            "initialized" => self.handle_initialized(request.id).await,
             "tools/list" => self.handle_list_tools(request.id).await,
             "tools/call" => self.handle_call_tool(request.id, request.params).await,
             _ => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
                 id: request.id,
                 result: None,
                 error: Some(JsonRpcError {
@@ -80,6 +111,7 @@ impl McpServer {
 
     async fn handle_initialize(&self, id: Option<Value>) -> JsonRpcResponse {
         JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
             id,
             result: Some(json!({
                 "protocolVersion": "2024-11-05",
@@ -92,6 +124,29 @@ impl McpServer {
                 }
             })),
             error: None,
+        }
+    }
+
+    async fn handle_initialized(&self, id: Option<Value>) -> JsonRpcResponse {
+        // eprintln!("Received initialized notification");
+        // Notifications don't require a response according to JSON-RPC spec
+        // Return empty response only if there's an id (making it a request)
+        if id.is_some() {
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(json!({})),
+                error: None,
+            }
+        } else {
+            // For notifications, we might not need to send a response
+            // but we'll send an empty one to be safe
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: Some(json!({})),
+                error: None,
+            }
         }
     }
 
@@ -295,6 +350,7 @@ impl McpServer {
         });
 
         JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
             id,
             result: Some(tools),
             error: None,
@@ -306,6 +362,7 @@ impl McpServer {
             Some(p) => p,
             None => {
                 return JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
                     id,
                     result: None,
                     error: Some(JsonRpcError {
@@ -339,6 +396,7 @@ impl McpServer {
         };
 
         JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
             id,
             result: Some(result),
             error: None,

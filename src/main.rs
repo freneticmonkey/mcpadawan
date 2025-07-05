@@ -25,6 +25,10 @@ struct Args {
     /// Run as MCP server instead of HTTP server
     #[arg(long, help = "Run as MCP (Model Context Protocol) server")]
     mcp: bool,
+    
+    /// Port for HTTP server
+    #[arg(short, long, default_value = "5050", help = "Port for HTTP server")]
+    port: u16,
 }
 
 // Configuration structure
@@ -48,13 +52,18 @@ async fn main() {
         Config::default()
     };
     
+    // Set MCP mode flag early so logging works correctly
+    if args.mcp {
+        mcpadawan::set_mcp_mode(true);
+    }
+    
     // Determine if ViGEm should be disabled (CLI flag takes precedence)
     let vigem_disabled = args.disable_vigem || config.disable_vigem;
     
     // Initialize ViGEm controller if not disabled
     #[cfg(feature = "vigem")]
     let controller = if vigem_disabled {
-        println!("ViGEm gamepad integration disabled");
+        mcpadawan::log_info("ViGEm gamepad integration disabled");
         None
     } else {
         match Client::connect() {
@@ -62,17 +71,17 @@ async fn main() {
                 let target = Target::new(TargetId::X360);
                 match client.plugin(&target) {
                     Ok(_) => {
-                        println!("ViGEm gamepad integration enabled");
+                        mcpadawan::log_info("ViGEm gamepad integration enabled");
                         Some(target)
                     }
                     Err(e) => {
-                        println!("Failed to plug in virtual controller: {}", e);
+                        mcpadawan::log_info(&format!("Failed to plug in virtual controller: {}", e));
                         None
                     }
                 }
             }
             Err(e) => {
-                println!("Failed to connect to ViGEmBus: {}", e);
+                mcpadawan::log_info(&format!("Failed to connect to ViGEmBus: {}", e));
                 None
             }
         }
@@ -81,9 +90,9 @@ async fn main() {
     #[cfg(not(feature = "vigem"))]
     let _controller = {
         if !vigem_disabled {
-            println!("ViGEm gamepad integration not compiled in (missing 'vigem' feature)");
+            mcpadawan::log_info("ViGEm gamepad integration not compiled in (missing 'vigem' feature)");
         } else {
-            println!("ViGEm gamepad integration disabled");
+            mcpadawan::log_info("ViGEm gamepad integration disabled");
         }
     };
 
@@ -97,7 +106,7 @@ async fn main() {
 
     if args.mcp {
         // Run as MCP server
-        println!("Starting MCPadawan as MCP server...");
+        mcpadawan::log_info("Starting MCPadawan as MCP server...");
         let mcp_server = mcpadawan::mcp::McpServer::new(state);
         if let Err(e) = mcp_server.run().await {
             eprintln!("MCP server error: {}", e);
@@ -106,10 +115,19 @@ async fn main() {
         // Run as HTTP server
         let app = create_app(state);
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], 5050));
-        println!("Listening on http://{}", addr);
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                mcpadawan::log_info(&format!("Listening on http://{}", addr));
+                if let Err(e) = axum::serve(listener, app).await {
+                    eprintln!("HTTP server error: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to bind to {}: {}", addr, e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 

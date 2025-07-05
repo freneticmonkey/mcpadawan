@@ -11,6 +11,29 @@ use vigem_client::{Client, TargetId, Target};
 
 pub mod mcp;
 
+// Global flag to track if we're in MCP mode
+use std::sync::OnceLock;
+static MCP_MODE: OnceLock<bool> = OnceLock::new();
+
+pub fn set_mcp_mode(enabled: bool) {
+    MCP_MODE.set(enabled).ok();
+}
+
+pub fn is_mcp_mode() -> bool {
+    MCP_MODE.get().copied().unwrap_or(false)
+}
+
+// Safe logging function that respects MCP mode
+pub fn log_info(message: &str) {
+    if is_mcp_mode() {
+        // In MCP mode, use stderr to avoid polluting stdout JSON-RPC channel
+        eprintln!("{}", message);
+    } else {
+        // In HTTP mode, use stdout normally
+        println!("{}", message);
+    }
+}
+
 // Thread-safe wrapper for Enigo
 pub struct ThreadSafeEnigo {
     inner: Enigo,
