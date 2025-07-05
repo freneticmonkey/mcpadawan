@@ -58,11 +58,14 @@ impl McpServer {
                     match serde_json::from_str::<JsonRpcRequest>(trimmed) {
                         Ok(request) => {
                             let response = self.handle_request(request).await;
-                            let response_json = serde_json::to_string(&response)?;
-                            // eprintln!("Sending: {}", response_json);
-                            stdout.write_all(response_json.as_bytes()).await?;
-                            stdout.write_all(b"\n").await?;
-                            stdout.flush().await?;
+                            // Only send response if it has an id or result/error
+                            if response.id.is_some() || response.result.is_some() || response.error.is_some() {
+                                let response_json = serde_json::to_string(&response)?;
+                                // eprintln!("Sending: {}", response_json);
+                                stdout.write_all(response_json.as_bytes()).await?;
+                                stdout.write_all(b"\n").await?;
+                                stdout.flush().await?;
+                            }
                         }
                         Err(e) => {
                             // eprintln!("JSON parse error: {}", e);
@@ -130,7 +133,7 @@ impl McpServer {
     async fn handle_initialized(&self, id: Option<Value>) -> JsonRpcResponse {
         // eprintln!("Received initialized notification");
         // Notifications don't require a response according to JSON-RPC spec
-        // Return empty response only if there's an id (making it a request)
+        // Only return a response if there's an id (making it a request, not a notification)
         if id.is_some() {
             JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
@@ -139,12 +142,11 @@ impl McpServer {
                 error: None,
             }
         } else {
-            // For notifications, we might not need to send a response
-            // but we'll send an empty one to be safe
+            // For notifications, return an empty response that won't be sent
             JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id: None,
-                result: Some(json!({})),
+                result: None,
                 error: None,
             }
         }
