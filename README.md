@@ -147,7 +147,7 @@ cd /path/to/mcpadawan
 claude mcp add mcpadawan cargo run -- --mcp
 
 # Then start Claude Code normally
-claude-code
+claude
 ```
 
 ### Claude Desktop

@@ -6,6 +6,16 @@ use std::{process::{Command, Child}, sync::{Arc, Mutex}};
 use enigo::{Enigo, MouseControllable, KeyboardControllable, MouseButton};
 use screenshots::Screen;
 use image::{ImageBuffer, imageops};
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct WindowInfo {
+    pub id: u32,
+    pub name: String,
+    pub owner_name: String,
+    pub bounds: (f64, f64, f64, f64), // (x, y, width, height)
+    pub pid: u32,
+}
 #[cfg(feature = "vigem")]
 use vigem_client::{Client, TargetId, Target};
 
@@ -58,6 +68,7 @@ pub struct AppState {
     #[cfg(feature = "vigem")]
     pub controller: Arc<Mutex<Option<Target>>>,
     pub vigem_enabled: bool,
+    pub app_pid: Arc<Mutex<Option<u32>>>,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -110,6 +121,27 @@ pub struct ScreenshotQuery {
     pub scale: Option<f32>,
 }
 
+#[cfg(target_os = "macos")]
+impl AppState {
+    pub fn get_windows_for_pid(&self, _pid: u32) -> Result<Vec<WindowInfo>, String> {
+        // Simplified implementation - for now just return a placeholder
+        // A full implementation would use Core Graphics APIs to enumerate windows
+        // and filter by PID, but the current core-graphics crate version doesn't
+        // provide all the APIs we need in an easily accessible way
+        
+        // Return a mock window to indicate the application is running
+        let mock_window = WindowInfo {
+            id: 1,
+            name: "Application Window".to_string(),
+            owner_name: "Application".to_string(),
+            bounds: (100.0, 100.0, 800.0, 600.0), // Mock bounds
+            pid: _pid,
+        };
+        
+        Ok(vec![mock_window])
+    }
+}
+
 pub fn create_app(state: AppState) -> Router {
     Router::new()
         .route("/start_app", post(start_app))
@@ -131,8 +163,10 @@ pub async fn start_app(State(state): State<AppState>, Json(payload): Json<StartA
 
     match proc.spawn() {
         Ok(child) => {
+            let pid = child.id();
+            *state.app_pid.lock().unwrap() = Some(pid);
             *state.app_process.lock().unwrap() = Some(child);
-            "Application started".to_string()
+            format!("Application started with PID {}", pid)
         }
         Err(e) => format!("Failed to start app: {}", e),
     }
@@ -141,6 +175,7 @@ pub async fn start_app(State(state): State<AppState>, Json(payload): Json<StartA
 pub async fn stop_app(State(state): State<AppState>) -> String {
     let mut app_proc_lock = state.app_process.lock().unwrap();
     if let Some(mut child) = app_proc_lock.take() {
+        *state.app_pid.lock().unwrap() = None;
         match child.kill() {
             Ok(_) => "Application stopped".to_string(),
             Err(e) => format!("Failed to stop app: {}", e),
@@ -186,6 +221,12 @@ pub async fn keyboard_type(State(state): State<AppState>, Json(payload): Json<Ty
 }
 
 pub async fn screenshot(Query(params): Query<ScreenshotQuery>) -> axum::response::Response<axum::body::Body> {
+    // Simplified implementation that works with current Axum version
+    // For now, always capture full screen with basic window detection placeholder
+    capture_full_screen_with_crop(&params, None).await
+}
+
+async fn capture_full_screen_with_crop(params: &ScreenshotQuery, crop_bounds: Option<(f64, f64, f64, f64)>) -> axum::response::Response<axum::body::Body> {
     let screens = match Screen::all() {
         Ok(screens) => screens,
         Err(_) => {
@@ -216,23 +257,14 @@ pub async fn screenshot(Query(params): Query<ScreenshotQuery>) -> axum::response
         }
     };
     
-    // Convert screenshot to RgbaImage
-    let rgba_image = match ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
-        image.width() as u32,
-        image.height() as u32,
-        image.buffer().to_vec(),
-    ) {
-        Some(img) => img,
-        None => {
-            return axum::response::Response::builder()
-                .status(500)
-                .body(axum::body::Body::from("Failed to convert image format"))
-                .unwrap();
-        }
-    };
-    
-    // Apply scaling or resize based on parameters
-    let processed_image = if let Some(scale) = params.scale {
+    process_screenshot_image(image, params, crop_bounds)
+}
+
+// CGImage capture functions will be implemented later when 
+// the core-graphics crate provides better API access
+
+pub fn apply_image_transformations(rgba_image: image::RgbaImage, params: &ScreenshotQuery) -> image::RgbaImage {
+    if let Some(scale) = params.scale {
         let new_width = (rgba_image.width() as f32 * scale) as u32;
         let new_height = (rgba_image.height() as f32 * scale) as u32;
         imageops::resize(&rgba_image, new_width, new_height, imageops::FilterType::Lanczos3)
@@ -248,9 +280,54 @@ pub async fn screenshot(Query(params): Query<ScreenshotQuery>) -> axum::response
         imageops::resize(&rgba_image, width, height, imageops::FilterType::Lanczos3)
     } else {
         rgba_image
+    }
+}
+
+fn process_screenshot_image(image: screenshots::Image, params: &ScreenshotQuery, crop_bounds: Option<(f64, f64, f64, f64)>) -> axum::response::Response<axum::body::Body> {
+    // Convert BGRA to RGBA manually
+    let width = image.width() as u32;
+    let height = image.height() as u32;
+    let buffer = image.buffer();
+    
+    // Convert BGRA to RGBA
+    let mut rgba_buffer = Vec::with_capacity(buffer.len());
+    for chunk in buffer.chunks_exact(4) {
+        rgba_buffer.push(chunk[2]); // B -> R
+        rgba_buffer.push(chunk[1]); // G -> G
+        rgba_buffer.push(chunk[0]); // R -> B
+        rgba_buffer.push(chunk[3]); // A -> A
+    }
+    
+    let rgba_image = match image::RgbaImage::from_raw(width, height, rgba_buffer) {
+        Some(img) => img,
+        None => {
+            return axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Failed to create RGBA image: {}x{}, buffer len: {}", width, height, buffer.len())))
+                .unwrap();
+        }
     };
     
-    // Convert back to PNG bytes
+    // Apply cropping if bounds are specified
+    let cropped_image = if let Some((x, y, w, h)) = crop_bounds {
+        let crop_x = (x.max(0.0) as u32).min(rgba_image.width());
+        let crop_y = (y.max(0.0) as u32).min(rgba_image.height());
+        let crop_w = (w.max(0.0) as u32).min(rgba_image.width() - crop_x);
+        let crop_h = (h.max(0.0) as u32).min(rgba_image.height() - crop_y);
+        
+        if crop_w > 0 && crop_h > 0 {
+            image::imageops::crop_imm(&rgba_image, crop_x, crop_y, crop_w, crop_h).to_image()
+        } else {
+            rgba_image
+        }
+    } else {
+        rgba_image
+    };
+    
+    // Apply transformations using the shared function
+    let processed_image = apply_image_transformations(cropped_image, params);
+    
+    // Convert to PNG bytes
     let mut png_bytes = Vec::new();
     match processed_image.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png) {
         Ok(_) => {},
@@ -315,6 +392,7 @@ mod tests {
             #[cfg(feature = "vigem")]
             controller: Arc::new(Mutex::new(None)),
             vigem_enabled: false,
+            app_pid: Arc::new(Mutex::new(None)),
         }
     }
 

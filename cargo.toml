@@ -17,6 +17,11 @@ clap = { version = "4.0", features = ["derive"] }
 toml = "0.8"
 base64 = "0.22"
 
+# macOS window management
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+core-graphics = "0.23"
+
 [dev-dependencies]
 tokio-test = "0.4"
 axum-test = "15.0"

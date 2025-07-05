@@ -1256,6 +1256,8 @@ dependencies = [
  "axum-test",
  "base64",
  "clap",
+ "core-foundation",
+ "core-graphics 0.23.2",
  "enigo",
  "hyper",
  "image",

@@ -1,0 +1,3 @@
+# mcpadawan configuration file
+# Set to true to disable ViGEm gamepad integration
+disable_vigem = false

@@ -414,6 +414,36 @@ impl McpServer {
             height: arguments.get("height").and_then(|v| v.as_u64().map(|u| u as u32)),
         };
 
+        // Check if we have an application running
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(_pid) = *self.state.app_pid.lock().unwrap() {
+                match self.state.get_windows_for_pid(_pid) {
+                    Ok(windows) => {
+                        if let Some(main_window) = windows.iter()
+                            .filter(|w| !w.name.is_empty() && w.bounds.2 > 50.0 && w.bounds.3 > 50.0)
+                            .max_by(|a, b| {
+                                let area_a = a.bounds.2 * a.bounds.3;
+                                let area_b = b.bounds.2 * b.bounds.3;
+                                area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+                            }) {
+                            
+                            // Capture full screen with cropping to window bounds
+                            return self.capture_full_screenshot_with_crop(&query, Some(main_window.bounds));
+                        }
+                    }
+                    Err(_) => {
+                        // If window detection fails, fall back to full screen
+                    }
+                }
+            }
+        }
+
+        // Default behavior: capture full screen
+        self.capture_full_screenshot_with_crop(&query, None)
+    }
+
+    fn capture_full_screenshot_with_crop(&self, query: &ScreenshotQuery, crop_bounds: Option<(f64, f64, f64, f64)>) -> Value {
         // Capture screenshot using same logic as HTTP endpoint
         let screens = match screenshots::Screen::all() {
             Ok(screens) => screens,
@@ -454,42 +484,57 @@ impl McpServer {
             }
         };
 
-        // Convert screenshot to RgbaImage
-        let rgba_image = match image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
-            image.width() as u32,
-            image.height() as u32,
-            image.buffer().to_vec(),
-        ) {
+        self.process_screenshot_image(image, query, crop_bounds)
+    }
+
+    // CGImage processing will be implemented later
+
+    fn process_screenshot_image(&self, image: screenshots::Image, query: &ScreenshotQuery, crop_bounds: Option<(f64, f64, f64, f64)>) -> Value {
+        // Try a simpler approach - just convert BGRA to RGBA manually
+        let width = image.width() as u32;
+        let height = image.height() as u32;
+        let buffer = image.buffer();
+        
+        // Convert BGRA to RGBA
+        let mut rgba_buffer = Vec::with_capacity(buffer.len());
+        for chunk in buffer.chunks_exact(4) {
+            rgba_buffer.push(chunk[2]); // B -> R
+            rgba_buffer.push(chunk[1]); // G -> G
+            rgba_buffer.push(chunk[0]); // R -> B
+            rgba_buffer.push(chunk[3]); // A -> A
+        }
+        
+        let rgba_image = match image::RgbaImage::from_raw(width, height, rgba_buffer) {
             Some(img) => img,
             None => {
                 return json!({
                     "content": [{
                         "type": "text",
-                        "text": "Failed to convert image format"
+                        "text": format!("Failed to create RGBA image: {}x{}, buffer len: {}", width, height, buffer.len())
                     }],
                     "isError": true
                 });
             }
         };
 
-        // Apply scaling or resize based on parameters
-        let processed_image = if let Some(scale) = query.scale {
-            let new_width = (rgba_image.width() as f32 * scale) as u32;
-            let new_height = (rgba_image.height() as f32 * scale) as u32;
-            image::imageops::resize(&rgba_image, new_width, new_height, image::imageops::FilterType::Lanczos3)
-        } else if let (Some(width), Some(height)) = (query.width, query.height) {
-            image::imageops::resize(&rgba_image, width, height, image::imageops::FilterType::Lanczos3)
-        } else if let Some(width) = query.width {
-            let aspect_ratio = rgba_image.height() as f32 / rgba_image.width() as f32;
-            let height = (width as f32 * aspect_ratio) as u32;
-            image::imageops::resize(&rgba_image, width, height, image::imageops::FilterType::Lanczos3)
-        } else if let Some(height) = query.height {
-            let aspect_ratio = rgba_image.width() as f32 / rgba_image.height() as f32;
-            let width = (height as f32 * aspect_ratio) as u32;
-            image::imageops::resize(&rgba_image, width, height, image::imageops::FilterType::Lanczos3)
+        // Apply cropping if bounds are specified
+        let cropped_image = if let Some((x, y, w, h)) = crop_bounds {
+            let crop_x = (x.max(0.0) as u32).min(rgba_image.width());
+            let crop_y = (y.max(0.0) as u32).min(rgba_image.height());
+            let crop_w = (w.max(0.0) as u32).min(rgba_image.width() - crop_x);
+            let crop_h = (h.max(0.0) as u32).min(rgba_image.height() - crop_y);
+            
+            if crop_w > 0 && crop_h > 0 {
+                image::imageops::crop_imm(&rgba_image, crop_x, crop_y, crop_w, crop_h).to_image()
+            } else {
+                rgba_image
+            }
         } else {
             rgba_image
         };
+        
+        // Apply transformations using the shared function
+        let processed_image = crate::apply_image_transformations(cropped_image, query);
 
         // Convert to PNG bytes
         let mut png_bytes = Vec::new();

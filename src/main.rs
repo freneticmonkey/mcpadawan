@@ -102,6 +102,7 @@ async fn main() {
         #[cfg(feature = "vigem")]
         controller: Arc::new(Mutex::new(controller)),
         vigem_enabled: !vigem_disabled && cfg!(feature = "vigem"),
+        app_pid: Arc::new(Mutex::new(None)),
     };
 
     if args.mcp {
