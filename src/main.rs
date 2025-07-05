@@ -1,20 +1,63 @@
 // mcp_server/src/main.rs
 
-use axum::{routing::post, routing::get, Router, Json, extract::State};
-use serde::{Deserialize, Serialize};
+use axum::{routing::post, routing::get, Router, Json, extract::{State, Query}};
+use serde::Deserialize;
 use std::{process::{Command, Child}, sync::{Arc, Mutex}};
 use std::net::SocketAddr;
-use enigo::{Enigo, MouseControllable, KeyboardControllable, Key, MouseButton};
+use enigo::{Enigo, MouseControllable, KeyboardControllable, MouseButton};
+
+// Thread-safe wrapper for Enigo
+struct ThreadSafeEnigo {
+    inner: Enigo,
+}
+
+unsafe impl Send for ThreadSafeEnigo {}
+unsafe impl Sync for ThreadSafeEnigo {}
+
+impl ThreadSafeEnigo {
+    fn new() -> Self {
+        ThreadSafeEnigo {
+            inner: Enigo::new(),
+        }
+    }
+}
 use screenshots::Screen;
-use tokio::task;
+use image::{ImageBuffer, RgbaImage, imageops};
+#[cfg(feature = "vigem")]
 use vigem_client::{Client, TargetId, Target};
+use clap::Parser;
+use std::fs;
+use std::path::Path;
+
+// Command line arguments
+#[derive(Parser)]
+#[command(name = "mcpadawan")]
+#[command(about = "A remote control server for applications")]
+struct Args {
+    /// Disable ViGEm gamepad integration
+    #[arg(long, help = "Disable ViGEm gamepad integration")]
+    disable_vigem: bool,
+    
+    /// Path to configuration file
+    #[arg(short, long, default_value = "config.toml", help = "Path to configuration file")]
+    config: String,
+}
+
+// Configuration structure
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    disable_vigem: bool,
+}
 
 // Struct to manage global state
 #[derive(Clone)]
 struct AppState {
-    enigo: Arc<Mutex<Enigo>>,
+    enigo: Arc<Mutex<ThreadSafeEnigo>>,
     app_process: Arc<Mutex<Option<Child>>>,
+    #[cfg(feature = "vigem")]
     controller: Arc<Mutex<Option<Target>>>,
+    vigem_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -60,16 +103,72 @@ struct GamepadInputRequest {
     right_thumb_y: i16,
 }
 
+#[derive(Deserialize)]
+struct ScreenshotQuery {
+    width: Option<u32>,
+    height: Option<u32>,
+    scale: Option<f32>,
+}
+
 #[tokio::main]
 async fn main() {
-    let client = Client::connect().expect("Failed to connect to ViGEmBus");
-    let target = Target::new(TargetId::X360);
-    client.plugin(&target).expect("Failed to plug in virtual controller");
+    let args = Args::parse();
+    
+    // Load configuration file
+    let config: Config = if Path::new(&args.config).exists() {
+        let config_content = fs::read_to_string(&args.config)
+            .expect("Failed to read configuration file");
+        toml::from_str(&config_content)
+            .expect("Failed to parse configuration file")
+    } else {
+        Config::default()
+    };
+    
+    // Determine if ViGEm should be disabled (CLI flag takes precedence)
+    let vigem_disabled = args.disable_vigem || config.disable_vigem;
+    
+    // Initialize ViGEm controller if not disabled
+    #[cfg(feature = "vigem")]
+    let controller = if vigem_disabled {
+        println!("ViGEm gamepad integration disabled");
+        None
+    } else {
+        match Client::connect() {
+            Ok(client) => {
+                let target = Target::new(TargetId::X360);
+                match client.plugin(&target) {
+                    Ok(_) => {
+                        println!("ViGEm gamepad integration enabled");
+                        Some(target)
+                    }
+                    Err(e) => {
+                        println!("Failed to plug in virtual controller: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Failed to connect to ViGEmBus: {}", e);
+                None
+            }
+        }
+    };
+    
+    #[cfg(not(feature = "vigem"))]
+    let _controller = {
+        if !vigem_disabled {
+            println!("ViGEm gamepad integration not compiled in (missing 'vigem' feature)");
+        } else {
+            println!("ViGEm gamepad integration disabled");
+        }
+    };
 
     let state = AppState {
-        enigo: Arc::new(Mutex::new(Enigo::new())),
+        enigo: Arc::new(Mutex::new(ThreadSafeEnigo::new())),
         app_process: Arc::new(Mutex::new(None)),
-        controller: Arc::new(Mutex::new(Some(target))),
+        #[cfg(feature = "vigem")]
+        controller: Arc::new(Mutex::new(controller)),
+        vigem_enabled: !vigem_disabled && cfg!(feature = "vigem"),
     };
 
     let app = Router::new()
@@ -118,68 +217,110 @@ async fn stop_app(State(state): State<AppState>) -> String {
 
 async fn mouse_click(State(state): State<AppState>, Json(payload): Json<ClickRequest>) -> String {
     let mut enigo = state.enigo.lock().unwrap();
-    enigo.mouse_move_to(payload.x, payload.y);
+    enigo.inner.mouse_move_to(payload.x, payload.y);
     let button = match payload.button.as_deref() {
         Some("right") => MouseButton::Right,
         Some("middle") => MouseButton::Middle,
         _ => MouseButton::Left,
     };
-    enigo.mouse_click(button);
+    enigo.inner.mouse_click(button);
     "Clicked".to_string()
 }
 
 async fn mouse_move(State(state): State<AppState>, Json(payload): Json<MoveRequest>) -> String {
     let mut enigo = state.enigo.lock().unwrap();
     if payload.relative.unwrap_or(false) {
-        enigo.mouse_move_relative(payload.x, payload.y);
+        enigo.inner.mouse_move_relative(payload.x, payload.y);
     } else {
-        enigo.mouse_move_to(payload.x, payload.y);
+        enigo.inner.mouse_move_to(payload.x, payload.y);
     }
     "Moved".to_string()
 }
 
 async fn mouse_scroll(State(state): State<AppState>, Json(payload): Json<ScrollRequest>) -> String {
     let mut enigo = state.enigo.lock().unwrap();
-    enigo.mouse_scroll_x(payload.x);
-    enigo.mouse_scroll_y(payload.y);
+    enigo.inner.mouse_scroll_x(payload.x);
+    enigo.inner.mouse_scroll_y(payload.y);
     "Scrolled".to_string()
 }
 
 async fn keyboard_type(State(state): State<AppState>, Json(payload): Json<TypeRequest>) -> String {
     let mut enigo = state.enigo.lock().unwrap();
-    enigo.key_sequence(&payload.text);
+    enigo.inner.key_sequence(&payload.text);
     "Typed".to_string()
 }
 
-async fn screenshot() -> axum::response::Response {
+async fn screenshot(Query(params): Query<ScreenshotQuery>) -> axum::response::Response<axum::body::Body> {
     let screens = Screen::all().unwrap();
     let screen = screens.into_iter().next().unwrap();
     let image = screen.capture().unwrap();
-    let buffer = image.to_png().unwrap();
+    
+    // Convert screenshot to RgbaImage
+    let rgba_image = ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
+        image.width() as u32,
+        image.height() as u32,
+        image.buffer().to_vec(),
+    ).unwrap();
+    
+    // Apply scaling or resize based on parameters
+    let processed_image = if let Some(scale) = params.scale {
+        let new_width = (rgba_image.width() as f32 * scale) as u32;
+        let new_height = (rgba_image.height() as f32 * scale) as u32;
+        imageops::resize(&rgba_image, new_width, new_height, imageops::FilterType::Lanczos3)
+    } else if let (Some(width), Some(height)) = (params.width, params.height) {
+        imageops::resize(&rgba_image, width, height, imageops::FilterType::Lanczos3)
+    } else if let Some(width) = params.width {
+        let aspect_ratio = rgba_image.height() as f32 / rgba_image.width() as f32;
+        let height = (width as f32 * aspect_ratio) as u32;
+        imageops::resize(&rgba_image, width, height, imageops::FilterType::Lanczos3)
+    } else if let Some(height) = params.height {
+        let aspect_ratio = rgba_image.width() as f32 / rgba_image.height() as f32;
+        let width = (height as f32 * aspect_ratio) as u32;
+        imageops::resize(&rgba_image, width, height, imageops::FilterType::Lanczos3)
+    } else {
+        rgba_image
+    };
+    
+    // Convert back to PNG bytes
+    let mut png_bytes = Vec::new();
+    processed_image.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).unwrap();
+    
     axum::response::Response::builder()
         .header("Content-Type", "image/png")
-        .body(axum::body::Bytes::from(buffer))
+        .body(axum::body::Body::from(png_bytes))
         .unwrap()
 }
 
-async fn gamepad_input(State(state): State<AppState>, Json(input): Json<GamepadInputRequest>) -> String {
-    if let Some(target) = &*state.controller.lock().unwrap() {
-        let report = vigem_client::X360ReportBuilder::new()
-            .button_a(input.button_a)
-            .button_b(input.button_b)
-            .trigger_left(input.left_trigger)
-            .trigger_right(input.right_trigger)
-            .thumb_lx(input.left_thumb_x)
-            .thumb_ly(input.left_thumb_y)
-            .thumb_rx(input.right_thumb_x)
-            .thumb_ry(input.right_thumb_y)
-            .build();
+async fn gamepad_input(State(state): State<AppState>, Json(_input): Json<GamepadInputRequest>) -> String {
+    if !state.vigem_enabled {
+        return "ViGEm gamepad integration is disabled or not compiled in".to_string();
+    }
+    
+    #[cfg(feature = "vigem")]
+    {
+        if let Some(target) = &*state.controller.lock().unwrap() {
+            let report = vigem_client::X360ReportBuilder::new()
+                .button_a(_input.button_a)
+                .button_b(_input.button_b)
+                .trigger_left(_input.left_trigger)
+                .trigger_right(_input.right_trigger)
+                .thumb_lx(_input.left_thumb_x)
+                .thumb_ly(_input.left_thumb_y)
+                .thumb_rx(_input.right_thumb_x)
+                .thumb_ry(_input.right_thumb_y)
+                .build();
 
-        match target.update(&report) {
-            Ok(_) => "Gamepad input sent".to_string(),
-            Err(e) => format!("Failed to update gamepad: {}", e),
+            match target.update(&report) {
+                Ok(_) => "Gamepad input sent".to_string(),
+                Err(e) => format!("Failed to update gamepad: {}", e),
+            }
+        } else {
+            "No gamepad connected".to_string()
         }
-    } else {
-        "No gamepad connected".to_string()
+    }
+    
+    #[cfg(not(feature = "vigem"))]
+    {
+        "ViGEm gamepad integration not compiled in (missing 'vigem' feature)".to_string()
     }
 }
